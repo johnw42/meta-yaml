@@ -1,15 +1,18 @@
 module Data.Yaml.Meta.Parser where
 
+import           Data.Yaml.Meta
+
 import           Control.Applicative (empty)
 import           Data.Char           (chr, digitToInt)
+import           Data.Maybe          (maybeToList)
 import           Numeric             (readHex)
 import           Text.Parsec         (Column, Parsec, SourcePos, char, count,
                                       digit, eof, getPosition, getState,
                                       hexDigit, lookAhead, many, many1,
                                       modifyState, notFollowedBy, oneOf, option,
-                                      optional, satisfy, skipMany, skipMany1,
-                                      sourceColumn, string, try, unexpected,
-                                      (<|>))
+                                      optionMaybe, optional, satisfy, skipMany,
+                                      skipMany1, sourceColumn, string, try,
+                                      unexpected, (<|>))
 import           Text.Parsec.Prim    (getInput, setInput)
 
 data ParserState = PS
@@ -22,7 +25,14 @@ initialState = PS Nothing
 type Parser a = Parsec String ParserState a
 
 -- | Try, but probably not needed.
+try' :: Parser a -> Parser a
 try' = try
+
+(<++>) :: Parser [a] -> Parser [a] -> Parser [a]
+p <++> p' = (++) <$> p <*> p'
+
+(<:>) :: Parser a -> Parser [a] -> Parser [a]
+p <:> p' = (:) <$> p <*> p'
 
 -- http://yaml.org/spec/1.2/spec.pdf
 
@@ -163,14 +173,20 @@ nbChar = do
     notFollowedBy cByteOrderMark
     cPrintable
 
--- 28, 29, 30
-bBreak, bAsLineFeed, bNonContent :: Parser String
+-- 28
+bBreak :: Parser ()
 bBreak =
-    try ((\cr lf -> [cr, lf]) <$> bCarriageReturn <*> bLineFeed) <|>
-    (: []) <$> bCarriageReturn <|>
-    (: []) <$> bLineFeed
-bAsLineFeed = bBreak
-bNonContent = bBreak
+    () <$ try (bCarriageReturn <* bLineFeed) <|>
+    () <$ bCarriageReturn <|>
+    () <$ bLineFeed
+
+-- 29
+bAsLineFeed :: Parser String
+bAsLineFeed = "\n" <$ bBreak
+
+-- 30
+bNonContent :: Parser String
+bNonContent = "" <$ bBreak
 
 -- 31, 32, 33
 sSpace, sTab, sWhite :: Parser Char
@@ -198,9 +214,7 @@ nsHexDigit = hexDigit
 
 -- 37
 nsAsciiLetter :: Parser Char
-nsAsciiLetter = satisfy p
-  where
-    p c = 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z'
+nsAsciiLetter = satisfy (\c -> 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z')
 
 -- 38
 nsWordChar :: Parser Char
@@ -214,9 +228,8 @@ nsUriChar =
 
 -- 40
 nsTagChar :: Parser String
-nsTagChar = do
-    try (notFollowedBy $ char '!')
-    try (notFollowedBy cFlowIndicator)
+nsTagChar =
+    try (notFollowedBy $ char '!') *> try (notFollowedBy cFlowIndicator) *>
     nsUriChar
 
 -- 41
@@ -307,8 +320,9 @@ nsEsc32Bit :: Parser Char
 nsEsc32Bit = readHexChar <$> count 8 nsHexDigit
 
 -- 62
+cNsEscChar :: Parser Char
 cNsEscChar =
-    char '\\' >>
+    char '\\' *>
     (nsEscNull <|>
      nsEscBell <|>
      nsEscBackspace <|>
@@ -339,13 +353,13 @@ sIndent' = length <$> many sSpace
 
 -- 64
 sIndentLt :: Int -> Parser ()
-sIndentLt 0 = unexpected "space"
-sIndentLt 1 = pure ()
-sIndentLt n = sSpace >> sIndentLt (n - 1)
+sIndentLt n = sIndentLe (n - 1)
 
 -- 65
 sIndentLe :: Int -> Parser ()
-sIndentLe n = sIndentLt (n + 1)
+sIndentLe n
+    | n > 0 = sSpace *> sIndentLe (n - 1)
+    | otherwise = pure ()
 
 lineStart :: Parser ()
 lineStart = do
@@ -387,21 +401,21 @@ sFlowLinePrefix :: Int -> Parser ()
 sFlowLinePrefix n = sIndent n >> sSeparateInLine
 
 -- 70
-lEmpty :: Int -> Context -> Parser ()
+lEmpty :: Int -> Context -> Parser Char
 lEmpty n c = do
     try (sLinePrefix n c) <|> sIndentLt n
-    () <$ bAsLineFeed
+    '\n' <$ bAsLineFeed
 
 -- 71
-blTrimmed :: Int -> Context -> Parser ()
-blTrimmed n c = bNonContent >> skipMany1 (lEmpty n c)
+blTrimmed :: Int -> Context -> Parser String
+blTrimmed n c = bNonContent *> many1 (lEmpty n c)
 
 -- 72
-bAsSpace :: Parser ()
-bAsSpace = () <$ bBreak
+bAsSpace :: Parser String
+bAsSpace = " " <$ bBreak
 
 -- 73
-bLFolded :: Column -> Context -> Parser ()
+bLFolded :: Column -> Context -> Parser String
 bLFolded n c = blTrimmed n c <|> bAsSpace
 
 -- 74
@@ -549,49 +563,43 @@ cNonSpecificTag :: Parser ()
 cNonSpecificTag = () <$ char '!'
 
 -- 101
-cNsAnchorProperty :: Parser ()
-cNsAnchorProperty = char '&' >> nsAnchorName
+cNsAnchorProperty :: Parser String
+cNsAnchorProperty = char '&' *> nsAnchorName
 
 -- 102
-nsAnchorChar :: Parser ()
-nsAnchorChar = try (notFollowedBy cFlowIndicator) >> (() <$ nsChar)
+nsAnchorChar :: Parser Char
+nsAnchorChar = try (notFollowedBy cFlowIndicator) *> nsChar
 
 -- 103
-nsAnchorName :: Parser ()
-nsAnchorName = skipMany1 nsAnchorChar
+nsAnchorName :: Parser String
+nsAnchorName = many1 nsAnchorChar
 
 -- 104
-cNsAliasNode :: Parser ()
-cNsAliasNode = char '*' >> nsAnchorName
+cNsAliasNode :: Parser Node
+cNsAliasNode = AliasNode <$ char '*' <*> nsAnchorName
 
 -- 105
-eScalar :: Parser ()
-eScalar = return ()
+eScalar :: Parser Node
+eScalar = return emptyNode
 
 -- 106
-eNode :: Parser ()
+eNode :: Parser Node
 eNode = eScalar
 
 -- 107
-nbDoubleChar :: Parser ()
-nbDoubleChar =
-    () <$ cNsEscChar <|>
-    (try (notFollowedBy $ oneOf "\\\"") >> nbJson >> return ())
+nbDoubleChar :: Parser Char
+nbDoubleChar = cNsEscChar <|> try (notFollowedBy $ oneOf "\\\"") *> nbJson
 
 -- 108
-nsDoubleChar :: Parser ()
-nsDoubleChar = try (notFollowedBy sWhite) >> nbDoubleChar
+nsDoubleChar :: Parser Char
+nsDoubleChar = try (notFollowedBy sWhite) *> nbDoubleChar
 
 -- 109
-cDoubleQuoted :: Column -> Context -> Parser ()
-cDoubleQuoted n c = do
-    char '"'
-    nbDoubleText n c
-    char '"'
-    return ()
+cDoubleQuoted :: Column -> Context -> Parser String
+cDoubleQuoted n c = char '"' *> nbDoubleText n c <* char '"'
 
 -- 110
-nbDoubleText :: Column -> Context -> Parser ()
+nbDoubleText :: Column -> Context -> Parser String
 nbDoubleText n FlowOut  = nbDoubleMultiLine n
 nbDoubleText n FlowIn   = nbDoubleMultiLine n
 nbDoubleText _ BlockKey = nbDoubleOneLine
@@ -599,16 +607,14 @@ nbDoubleText _ FlowKey  = nbDoubleOneLine
 nbDoubleText _ c        = badContext c
 
 -- 111
-nbDoubleOneLine :: Parser ()
-nbDoubleOneLine = skipMany nbDoubleChar
+nbDoubleOneLine :: Parser String
+nbDoubleOneLine = many nbDoubleChar
 
 -- 112
 sDoubleEscaped :: Column -> Parser ()
-sDoubleEscaped n = do
-    many sWhite
-    char '\\'
-    bNonContent
-    many (lEmpty n FlowIn)
+sDoubleEscaped n =
+    many sWhite *> char '\\' *>
+    (bNonContent <++> (concat <$> many (lEmpty n FlowIn))) <*
     sFlowLinePrefix n
 
 -- 113
@@ -629,28 +635,24 @@ sDoubleNextLine n =
 
 -- 116
 nbDoubleMultiLine :: Column -> Parser ()
-nbDoubleMultiLine n = nbNsDoubleInLine >> (sDoubleNextLine n <|> skipMany sWhite)
+nbDoubleMultiLine n =
+    nbNsDoubleInLine >> (sDoubleNextLine n <|> skipMany sWhite)
 
 -- 117
-cQuotedQuote :: Parser ()
-cQuotedQuote = () <$ string "''"
+cQuotedQuote :: Parser Char
+cQuotedQuote = '\'' <$ string "''"
 
 -- 118
-nbSingleChar :: Parser ()
-nbSingleChar =
-    try (notFollowedBy (char '\'') >> nbJson >> return ()) <|> cQuotedQuote
+nbSingleChar :: Parser Char
+nbSingleChar = try (notFollowedBy (char '\'') *> nbJson) <|> cQuotedQuote
 
 -- 119
-nsSingleChar :: Parser ()
-nsSingleChar = try (notFollowedBy sWhite) >> nbSingleChar
+nsSingleChar :: Parser Char
+nsSingleChar = try (notFollowedBy sWhite) *> nbSingleChar
 
 -- 120
-cSingleQuoted :: Column -> Context -> Parser ()
-cSingleQuoted n c = do
-    char '\''
-    nbSingleText n c
-    char '\''
-    return ()
+cSingleQuoted :: Column -> Context -> Parser String
+cSingleQuoted n c = char '\'' *> nbSingleText n c <* char '\''
 
 -- 121
 nbSingleText :: Column -> Context -> Parser ()
@@ -661,19 +663,19 @@ nbSingleText _ FlowKey  = nbSingleOneLine
 nbSingleText _ c        = badContext c
 
 -- 122
-nbSingleOneLine :: Parser ()
-nbSingleOneLine = skipMany nbSingleChar
+nbSingleOneLine :: Parser String
+nbSingleOneLine = many nbSingleChar
 
 -- 123
-nbNsSingleInLine :: Parser ()
-nbNsSingleInLine = skipMany (many sWhite >> nsSingleChar)
+nbNsSingleInLine :: Parser String
+nbNsSingleInLine = many (many sWhite *> nsSingleChar)
 
 -- 124
 sSingleNextLine :: Column -> Parser ()
 sSingleNextLine n =
     sFlowFolded n >>
     optional
-        (nsSingleChar >> nbNsSingleInLine >>
+        (nsSingleChar <:> nbNsSingleInLine <++>
          (sSingleNextLine n <|> skipMany sWhite))
 
 -- 125
@@ -940,10 +942,10 @@ cChompingIndicator :: Parser Chomping
 cChompingIndicator = Strip <$ char '-' <|> Keep <$ char '+' <|> pure Clip
 
 -- 165
-bChompedLast :: Chomping -> Parser ()
-bChompedLast Strip = () <$ bNonContent
-bChompedLast Clip  = () <$ bAsLineFeed
-bChompedLast Keep  = () <$ bAsLineFeed
+bChompedLast :: Chomping -> Parser String
+bChompedLast Strip = bNonContent
+bChompedLast Clip  = bAsLineFeed
+bChompedLast Keep  = bAsLineFeed
 
 -- 166
 lChompedEmpty :: Column -> Chomping -> Parser ()
@@ -953,20 +955,17 @@ lChompedEmpty n Keep  = lKeepEmpty n
 
 -- 167
 lStripEmpty :: Column -> Parser ()
-lStripEmpty n = many (sIndentLe n >> bNonContent) >> optional (lTrailComments n)
+lStripEmpty n =
+    many (sIndentLe n *> bNonContent) *> option "" (lTrailComments n)
 
 -- 168
-lKeepEmpty :: Column -> Parser ()
-lKeepEmpty n = many (lEmpty n BlockIn) >> optional (lTrailComments n)
+lKeepEmpty :: Column -> Parser String
+lKeepEmpty n =
+    (concat <$> many (lEmpty n BlockIn)) <++> option "" (lTrailComments n)
 
 -- 169
-lTrailComments :: Column -> Parser ()
-lTrailComments n = do
-    sIndentLe n
-    cNbCommentText
-    bComment
-    many lComment
-    return ()
+lTrailComments :: Column -> Parser String
+lTrailComments n = sIndentLe n *> cNbCommentText <* bComment <* many lComment
 
 -- 170
 cLPlusLiteral :: Column -> Parser ()
@@ -981,25 +980,25 @@ cLPlusLiteral n = do
     lLiteralContent n' t
 
 -- 171
-lNbLiteralText :: Column -> Parser ()
-lNbLiteralText n = do
-    many (lEmpty n BlockIn)
-    sIndent n
-    many1 nbChar
-    return ()
+lNbLiteralText :: Column -> Parser String
+lNbLiteralText n =
+    (concat <$> many (lEmpty n BlockIn)) <++> (sIndent n *> many1 nbChar)
 
 -- 172
-bNbLiteralNext :: Column -> Parser ()
-bNbLiteralNext n = bAsLineFeed >> lNbLiteralText n
+bNbLiteralNext :: Column -> Parser String
+bNbLiteralNext n = bAsLineFeed <:> lNbLiteralText n
 
 -- 173
-lLiteralContent :: Column -> Chomping -> Parser ()
+lLiteralContent :: Column -> Chomping -> Parser String
 lLiteralContent n t =
-    optional (lNbLiteralText n >> many (bNbLiteralNext n) >> bChompedLast t) >>
+    option
+        ""
+        (lNbLiteralText n <++> (concat <$> many (bNbLiteralNext n)) <++>
+         bChompedLast t) <++>
     lChompedEmpty n t
 
 -- 174
-cLPlusFolded :: Column -> Parser ()
+cLPlusFolded :: Column -> Parser String
 cLPlusFolded n = do
     char '>'
     (m, t) <- cBBlockHeader
@@ -1012,150 +1011,147 @@ cLPlusFolded n = do
 
 -- 175
 sNbFoldedText :: Column -> Parser ()
-sNbFoldedText n = do
-    sIndent n
-    nsChar
-    many nbChar
-    return ()
+sNbFoldedText n = sIndent n *> nsChar <:> many nbChar
 
 -- 176
-lNbFoldedLines :: Column -> Parser ()
+lNbFoldedLines :: Column -> Parser String
 lNbFoldedLines n =
-    sNbFoldedText n >> skipMany (bLFolded n BlockIn >> sNbFoldedText n)
+    sNbFoldedText n <++>
+    (concat <$> many (bLFolded n BlockIn <++> sNbFoldedText n))
 
 -- 177
-sNbSpacedText :: Column -> Parser ()
-sNbSpacedText n = sIndent n >> sWhite >> skipMany nbChar
+sNbSpacedText :: Column -> Parser String
+sNbSpacedText n = sIndent n *> sWhite <++> many nbChar
 
 -- 178
-bLSpaced :: Column -> Parser ()
-bLSpaced n = bAsLineFeed >> skipMany (lEmpty n BlockIn)
+bLSpaced :: Column -> Parser String
+bLSpaced n = bAsLineFeed <:> many (lEmpty n BlockIn)
 
 -- 179
-lNbSpacedLines :: Column -> Parser ()
-lNbSpacedLines n = sNbSpacedText n >> skipMany (bLSpaced n >> sNbSpacedText n)
+lNbSpacedLines :: Column -> Parser String
+lNbSpacedLines n =
+    sNbSpacedText n <++> (concat <$> many (bLSpaced n <++> sNbSpacedText n))
 
 -- 180
-lNbSameLines :: Column -> Parser ()
+lNbSameLines :: Column -> Parser String
 lNbSameLines n =
-    many (lEmpty n BlockIn) >> (lNbFoldedLines n <|> lNbSpacedLines n)
+    many (lEmpty n BlockIn) <++> (lNbFoldedLines n <|> lNbSpacedLines n)
 
 -- 181
-lNbDiffLines :: Column -> Parser ()
-lNbDiffLines n = lNbSameLines n >> skipMany (bAsLineFeed >> lNbSameLines n)
+lNbDiffLines :: Column -> Parser String
+lNbDiffLines n =
+    lNbSameLines n <++> (concat <$> many (bAsLineFeed <:> lNbSameLines n))
 
 -- 182
-lFoldedContent :: Column -> Chomping -> Parser ()
+lFoldedContent :: Column -> Chomping -> Parser String
 lFoldedContent n t =
     try (optional $ lNbDiffLines n >> bChompedLast t) >> lChompedEmpty n t
 
 -- 183
-lPlusBlockSequence :: Column -> Parser ()
+lPlusBlockSequence :: Column -> Parser Node
 lPlusBlockSequence n = do
-    sIndent (n  + 1)
+    sIndent (n + 1)
     m <- sIndent'
     let n' = n + 1 + m
-    cLBlockSeqEntry n'
-    many (sIndent n' >> cLBlockSeqEntry n')
-    return ()
+    SeqNode <$>
+        ((:) <$> cLBlockSeqEntry n' <*> many (sIndent n' *> cLBlockSeqEntry n'))
 
 -- 184
-cLBlockSeqEntry :: Column -> Parser ()
-cLBlockSeqEntry n = do
-    char '-'
-    notFollowedBy nsChar
-    sLPlusBlockIndented n BlockIn
+cLBlockSeqEntry :: Column -> Parser Node
+cLBlockSeqEntry n =
+    char '-' *> notFollowedBy nsChar *> sLPlusBlockIndented n BlockIn
 
 -- 185
-sLPlusBlockIndented :: Column -> Context -> Parser ()
+sLPlusBlockIndented :: Column -> Context -> Parser Node
 sLPlusBlockIndented n c =
     (do m <- sIndent'
         let n' = n + 1 + m
         (try' (nsLCompactSequence n') <|> nsLCompactMapping n')) <|>
-    sLPlusBlockNode n c <|>
-    (eNode >> sLComments >> return ())
+    sLPlusBlockNode n c <|> eNode <* sLComments
 
 -- 186
-nsLCompactSequence :: Column -> Parser ()
+nsLCompactSequence :: Column -> Parser Node
 nsLCompactSequence n =
-    cLBlockSeqEntry n >> skipMany (sIndent n >> cLBlockSeqEntry n)
+    SeqNode <$>
+    ((:) <$> cLBlockSeqEntry n <*> many (sIndent n *> cLBlockSeqEntry n))
 
 -- 187
-lPlusBlockMapping :: Column -> Parser ()
+lPlusBlockMapping :: Column -> Parser Node
 lPlusBlockMapping n = do
     sIndent (n + 1)
     m <- sIndent'
     let n' = n + 1 + m
-    nsLBlockMapEntry n'
-    many (sIndent n' >> nsLBlockMapEntry n')
-    return ()
+    MapNode <$>
+        ((:) <$> nsLBlockMapEntry n' <*>
+         many (sIndent n' *> nsLBlockMapEntry n'))
 
 -- 188
-nsLBlockMapEntry :: Column -> Parser ()
+nsLBlockMapEntry :: Column -> Parser (Node, Node)
 nsLBlockMapEntry n = try' (cLBlockMapExplicitEntry n) <|> nsLBlockMapImplicitEntry n
 
 -- 189
-cLBlockMapExplicitEntry :: Column -> Parser ()
+cLBlockMapExplicitEntry :: Column -> Parser (Node, Node)
 cLBlockMapExplicitEntry n =
-    cLBlockMapExplicitKey n >> (try' (lBlockMapExplicitValue n) <|> eNode)
+    (,) <$> cLBlockMapExplicitKey n <*>
+    (try' (lBlockMapExplicitValue n) <|> eNode)
 
 -- 190
-cLBlockMapExplicitKey :: Column -> Parser ()
-cLBlockMapExplicitKey n = char '?' >> sLPlusBlockIndented n BlockOut
+cLBlockMapExplicitKey :: Column -> Parser Node
+cLBlockMapExplicitKey n = char '?' *> sLPlusBlockIndented n BlockOut
 
 -- 191
-lBlockMapExplicitValue :: Column -> Parser ()
+lBlockMapExplicitValue :: Column -> Parser Node
 lBlockMapExplicitValue n =
-    sIndent n >> char ':' >> sLPlusBlockIndented n BlockOut
+    sIndent n *> char ':' *> sLPlusBlockIndented n BlockOut
 
 -- 192
-nsLBlockMapImplicitEntry :: Column -> Parser ()
+nsLBlockMapImplicitEntry :: Column -> Parser (Node, Node)
 nsLBlockMapImplicitEntry n =
-    (try' nsSBlockMapImplicitKey <|> eNode) >> cLBlockMapImplicitValue n
+    (,) <$> (try' nsSBlockMapImplicitKey <|> eNode) <*>
+    cLBlockMapImplicitValue n
 
 -- 193
-nsSBlockMapImplicitKey :: Parser ()
+nsSBlockMapImplicitKey :: Parser Node
 nsSBlockMapImplicitKey =
     try' (cSImplicitJsonKey BlockKey) <|> nsSImplicitYamlKey BlockKey
 
 -- 194
-cLBlockMapImplicitValue :: Column -> Parser ()
+cLBlockMapImplicitValue :: Column -> Parser Node
 cLBlockMapImplicitValue n =
-    char ':' >>
-    (try' (sLPlusBlockNode n BlockOut) <|> (eNode >> sLComments >> return ()))
+    char ':' *> (try' (sLPlusBlockNode n BlockOut) <|> eNode <* sLComments)
 
 -- 195
-nsLCompactMapping :: Column -> Parser ()
+nsLCompactMapping :: Column -> Parser Node
 nsLCompactMapping n =
-    nsLBlockMapEntry n >> skipMany (sIndent n >> nsLBlockMapEntry n)
+    MapNode <$>
+    ((:) <$> nsLBlockMapEntry n <*> many (sIndent n *> nsLBlockMapEntry n))
 
 -- 196
-sLPlusBlockNode :: Column -> Context -> Parser ()
+sLPlusBlockNode :: Column -> Context -> Parser Node
 sLPlusBlockNode n c = try' (sLPlusBlockInBlock n c) <|> sLPlusFlowInBlock n
 
 -- 197
-sLPlusFlowInBlock :: Column -> Parser ()
+sLPlusFlowInBlock :: Column -> Parser Node
 sLPlusFlowInBlock n = do
     sSeparate (n + 1) FlowOut
-    nsFlowNode (n + 1) FlowOut
+    node <- nsFlowNode (n + 1) FlowOut
     sLComments
-    return ()
+    return node
 
 -- 198
-sLPlusBlockInBlock :: Column -> Context -> Parser ()
+sLPlusBlockInBlock :: Column -> Context -> Parser Node
 sLPlusBlockInBlock n c =
     try' (sLPlusBlockScalar n c) <|> sLPlusBlockCollection n c
 
 -- 199
-sLPlusBlockScalar :: Column -> Context -> Parser ()
+sLPlusBlockScalar :: Column -> Context -> Parser Node
 sLPlusBlockScalar n c = do
     sSeparate (n + 1) c
     optional (cNsProperties (n + 1) c >> sSeparate (n + 1) c)
     (try' (cLPlusLiteral n) <|> cLPlusFolded n)
-    return ()
 
 -- 200
-sLPlusBlockCollection :: Column -> Context -> Parser ()
+sLPlusBlockCollection :: Column -> Context -> Parser Node
 sLPlusBlockCollection n c = do
     try (optional $ sSeparate (n + 1) c >> cNsProperties (n + 1) c)
     sLComments
@@ -1195,34 +1191,42 @@ cForbidden = do
     return ()
 
 -- 207
-lBareDocument :: Parser ()
+lBareDocument :: Parser Document
 lBareDocument = do
     notFollowedBy cForbidden
-    sLPlusBlockNode (-1) BlockIn
+    node <- sLPlusBlockNode (-1) BlockIn
+    return $ Document node
 
 -- 208
-lExplicitDocument :: Parser ()
+lExplicitDocument :: Parser Document
 lExplicitDocument =
     cDirectivesEnd >>
-    (try' lBareDocument <|> (eNode >> sLComments >> return ()))
+    (try' lBareDocument <|> (eNode >> sLComments >> return Document))
 
 -- 209
-lDirectiveDocument :: Parser ()
-lDirectiveDocument = many1 lDirective >> lExplicitDocument
+lDirectiveDocument :: Parser Document
+lDirectiveDocument = many1 lDirective *> lExplicitDocument
 
 -- 210
-lAnyDocument :: Parser ()
+lAnyDocument :: Parser Document
 lAnyDocument =
     try' lDirectiveDocument <|> try' lExplicitDocument <|> lBareDocument
 
 -- 211
-lYamlStream :: Parser ()
+lYamlStream :: Parser Stream
 lYamlStream = do
     many (try' lDocumentPrefix')
-    try (optional lAnyDocument)
-    many
-        ((many1 (try' lDocumentSuffix) >> many (try' lDocumentPrefix) >>
-          try (optional lAnyDocument)) <|>
-         (many1 (try' lDocumentPrefix') >> optional (try' lExplicitDocument)) <|>
-         lExplicitDocument)
-    return ()
+    maybeDoc <- try (optionList lAnyDocument)
+    docs <-
+        concat <$>
+        many
+            ((many1 (try' lDocumentSuffix) *> many (try' lDocumentPrefix) *>
+              try' (optionList lAnyDocument)) <|>
+             (many1 (try' lDocumentPrefix') *>
+              try' (optionList lExplicitDocument)) <|>
+             (: []) <$> lExplicitDocument)
+    eof
+    return . Stream $ maybeDoc ++ docs
+  where
+    optionList :: Parser a -> Parser [a]
+    optionList p = maybeToList <$> optionMaybe p
