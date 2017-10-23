@@ -1,4 +1,4 @@
-module Meta where
+module Data.Yaml.Meta.Parser where
 
 import           Control.Applicative (empty)
 import           Data.Char           (chr, digitToInt)
@@ -132,7 +132,7 @@ cDoubleQuote = char '"'
 cDirective :: Parser Char
 cDirective = char '%'
 
--- 21
+-- 21 TODO: Fail if this rule matches.
 cReserved :: Parser Char
 cReserved = oneOf "@`"
 
@@ -159,8 +159,8 @@ bChar = bLineFeed <|> bCarriageReturn
 -- 27
 nbChar :: Parser Char
 nbChar = do
-    try (notFollowedBy bChar)
-    try (notFollowedBy cByteOrderMark)
+    notFollowedBy bChar
+    notFollowedBy cByteOrderMark
     cPrintable
 
 -- 28, 29, 30
@@ -684,7 +684,7 @@ nbSingleMultiLine n =
 -- 126
 nsPlainFirst :: Context -> Parser ()
 nsPlainFirst c =
-    (try (notFollowedBy cIndicator) >> nsChar >> return ()) <|>
+    (notFollowedBy cIndicator >> nsChar >> return ()) <|>
     (oneOf "?:-" >> try (lookAhead $ nsPlainSafe c))
 
 -- 127
@@ -701,12 +701,12 @@ nsPlainSafeOut = nsChar >> return ()
 
 -- 129
 nsPlainSafeIn :: Parser ()
-nsPlainSafeIn = try (notFollowedBy cFlowIndicator) >> nsChar >> return ()
+nsPlainSafeIn = notFollowedBy cFlowIndicator >> nsChar >> return ()
 
 -- 130
 nsPlainChar :: Context -> Parser ()
 nsPlainChar c =
-    (try (notFollowedBy $ oneOf ":#") >> nsPlainSafe c) <|>
+    (notFollowedBy (oneOf ":#") >> nsPlainSafe c) <|>
     (do pos <- getPosition
         plainCharPos <- lastPlainCharPos <$> getState
         if plainCharPos == Just pos
@@ -829,7 +829,7 @@ cNsFlowMapEmptyKeyEntry n c = eNode >> cNsFlowMapSeparateValue n c
 cNsFlowMapSeparateValue :: Column -> Context -> Parser ()
 cNsFlowMapSeparateValue n c = do
     char ':'
-    try (notFollowedBy (nsPlainSafe c))
+    notFollowedBy (nsPlainSafe c)
     (try (sSeparate n c >> nsFlowNode n c) <|> eNode)
 
 -- 148
@@ -1063,7 +1063,7 @@ lPlusBlockSequence n = do
 cLBlockSeqEntry :: Column -> Parser ()
 cLBlockSeqEntry n = do
     char '-'
-    try $ notFollowedBy nsChar
+    notFollowedBy nsChar
     sLPlusBlockIndented n BlockIn
 
 -- 185
@@ -1131,7 +1131,7 @@ nsLCompactMapping n =
 
 -- 196
 sLPlusBlockNode :: Column -> Context -> Parser ()
-sLPlusBlockNode n c = try' (sLPlusBlockNode n c) <|> sLPlusFlowInBlock n
+sLPlusBlockNode n c = try' (sLPlusBlockInBlock n c) <|> sLPlusFlowInBlock n
 
 -- 197
 sLPlusFlowInBlock :: Column -> Parser ()
@@ -1171,6 +1171,9 @@ seqSpaces _ c        = badContext c
 lDocumentPrefix :: Parser ()
 lDocumentPrefix = try' (optional cByteOrderMark) >> skipMany lComment
 
+lDocumentPrefix' :: Parser ()
+lDocumentPrefix' = (cByteOrderMark >> skipMany lComment) <|> skipMany1 lComment
+
 -- 203
 cDirectivesEnd :: Parser ()
 cDirectivesEnd = () <$ string "---"
@@ -1194,7 +1197,7 @@ cForbidden = do
 -- 207
 lBareDocument :: Parser ()
 lBareDocument = do
-    try (notFollowedBy cForbidden)
+    notFollowedBy cForbidden
     sLPlusBlockNode (-1) BlockIn
 
 -- 208
@@ -1215,10 +1218,11 @@ lAnyDocument =
 -- 211
 lYamlStream :: Parser ()
 lYamlStream = do
-    many (try' lDocumentPrefix)
+    many (try' lDocumentPrefix')
     try (optional lAnyDocument)
     many
         ((many1 (try' lDocumentSuffix) >> many (try' lDocumentPrefix) >>
           try (optional lAnyDocument)) <|>
-         (many (try' lDocumentPrefix) >> optional (try' lExplicitDocument)))
+         (many1 (try' lDocumentPrefix') >> optional (try' lExplicitDocument)) <|>
+         lExplicitDocument)
     return ()
