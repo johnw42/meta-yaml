@@ -1,14 +1,16 @@
 module Data.Yaml.Meta where
 
-data Stream = Stream [Document] deriving Show
+data Stream = Stream [Document] deriving (Eq, Show)
 
-data Document = Document Node deriving Show
+data Document = Document Node deriving (Eq, Show)
 
 data Node
     = SeqNode [Node]
-    | MapNode [(Node, Node)]
+    | MapNode [KeyVal]
     | ScalarNode String
     | AliasNode String
-    deriving (Show)
+    deriving (Eq, Show)
+
+data KeyVal = KeyVal Node Node deriving (Eq, Show)
 
 emptyNode = ScalarNode ""
